@@ -1,0 +1,78 @@
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  imageName: 'hello-world'
+  dockerRegistryServiceConnection: 'ACR-Connection'
+  acrName: 'devopsram.azurecr.io'
+  vmHostname: 'devopslxvm'
+  sshServiceConnection: 'Linux-VM-SSH'
+  containerPort: 8080
+  hostPort: 80
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: Build
+  displayName: 'Build Java App'
+  jobs:
+    - job: MavenBuild
+      steps:
+        - task: Maven@3
+          inputs:
+            mavenPomFile: 'pom.xml'
+            goals: 'clean package'
+            publishJunitResults: true
+            javaHomeOptions: 'JDKVersion'
+            jdkVersionOption: 1.11
+            testResultsFiles: '**/TEST-*.xml'
+
+- stage: DockerBuildAndPush
+  displayName: 'Docker Build & Push to ACR'
+  dependsOn: Build
+  jobs:
+    - job: DockerImage
+      steps:
+        - task: Docker@2
+          inputs:
+            containerRegistry: '$(dockerRegistryServiceConnection)'
+            repository: '$(imageName)'
+            command: 'buildAndPush'
+            Dockerfile: '**/Dockerfile'
+            tags: |
+              latest
+              $(Build.BuildId)
+        - script: |
+            chmod +x ./trivy-scan.sh
+            ./trivy-scan.sh $(acrName)/$(imageName):$(Build.BuildId)
+          displayName: 'Run Trivy Security Scan'
+
+- stage: Deploy
+  displayName: 'Deploy to Linux VM'
+  dependsOn: DockerBuildAndPush
+  condition: succeeded()
+  approval:
+    approvals:
+      - approvalType: 'Manual'
+        reviewers:
+          - 'rarunaselvi@gmail.com'
+  jobs:
+    - job: DeployToVM
+      steps:
+        - task: SSH@0
+          inputs:
+            sshEndpoint: '$(sshServiceConnection)'
+            runOptions: 'inline'
+            inline: |
+              docker pull $(acrName)/$(imageName):$(Build.BuildId) || docker pull $(acrName)/$(imageName):latest
+              docker stop app || true
+              docker rm app || true
+              docker run -d --name app -p $(hostPort):$(containerPort) $(acrName)/$(imageName):$(Build.BuildId)
+        - task: AzureKeyVault@2
+          inputs:
+            azureSubscription: '<AzureServiceConnection>'
+            KeyVaultName: '<Your-KeyVault-Name>'
+            SecretsFilter: '*'
